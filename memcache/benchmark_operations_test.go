@@ -29,7 +29,10 @@ func setupBenchmarkClient(b *testing.B) *Client {
 	if err != nil {
 		b.Skipf("skipping benchmark; no server running at localhost:11211")
 	}
-	c.Close()
+	err = c.Close()
+	if err != nil {
+		b.Fatalf("failed to close connection: %v", err)
+	}
 
 	client, err := New("localhost:11211")
 	if err != nil {
@@ -59,7 +62,6 @@ func BenchmarkSetGet(b *testing.B) {
 		}
 	}
 }
-
 
 // BenchmarkSet benchmarks Set operations only
 func BenchmarkSet(b *testing.B) {
@@ -109,7 +111,10 @@ func BenchmarkAdd(b *testing.B) {
 	// Pre-delete keys to ensure Add will succeed
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("bench_add_key_%d", i)
-		c.Delete([]byte(key)) // Ignore error if key doesn't exist
+		err := c.Delete([]byte(key)) // Ignore error if key doesn't exist
+		if err != nil && err != ErrCacheMiss {
+			b.Fatal(err)
+		}
 	}
 
 	b.ResetTimer()
