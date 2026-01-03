@@ -17,107 +17,17 @@ limitations under the License.
 package memcache
 
 import (
+	"bufio"
 	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
 	"testing"
-
-	"github.com/cloudwego/netpoll"
 )
 
-// mockNetpollReader implements netpoll.Reader for testing.
-type mockNetpollReader struct {
-	data   []byte
-	offset int
-}
-
-func newMockNetpollReader(s string) *mockNetpollReader {
-	return &mockNetpollReader{data: []byte(s)}
-}
-
-func (m *mockNetpollReader) Next(n int) ([]byte, error) {
-	if m.offset >= len(m.data) {
-		return nil, netpoll.ErrEOF
-	}
-
-	end := m.offset + n
-	if end > len(m.data) {
-		end = len(m.data)
-	}
-
-	result := m.data[m.offset:end]
-	m.offset = end
-
-	return result, nil
-}
-
-func (m *mockNetpollReader) Peek(n int) ([]byte, error) {
-	if m.offset >= len(m.data) {
-		return nil, netpoll.ErrEOF
-	}
-
-	end := m.offset + n
-	if end > len(m.data) {
-		end = len(m.data)
-	}
-
-	return m.data[m.offset:end], nil
-}
-
-func (m *mockNetpollReader) Skip(n int) error {
-	m.offset += n
-	if m.offset > len(m.data) {
-		m.offset = len(m.data)
-	}
-
-	return nil
-}
-
-func (m *mockNetpollReader) Until(delim byte) ([]byte, error) {
-	for i := m.offset; i < len(m.data); i++ {
-		if m.data[i] == delim {
-			result := m.data[m.offset : i+1]
-			m.offset = i + 1
-
-			return result, nil
-		}
-	}
-
-	return nil, netpoll.ErrEOF
-}
-
-func (m *mockNetpollReader) Release() error {
-	return nil
-}
-
-func (m *mockNetpollReader) Slice(n int) (netpoll.Reader, error) {
-	return nil, nil
-}
-
-func (m *mockNetpollReader) Len() int {
-	return len(m.data) - m.offset
-}
-
-func (m *mockNetpollReader) ReadString(n int) (string, error) {
-	b, err := m.Next(n)
-
-	return string(b), err
-}
-
-func (m *mockNetpollReader) ReadBinary(n int) ([]byte, error) {
-	return m.Next(n)
-}
-
-func (m *mockNetpollReader) ReadByte() (byte, error) {
-	if m.offset >= len(m.data) {
-		return 0, netpoll.ErrEOF
-	}
-
-	b := m.data[m.offset]
-	m.offset++
-
-	return b, nil
+// newMockReader creates a bufio.Reader for testing.
+func newMockReader(s string) *bufio.Reader {
+	return bufio.NewReader(strings.NewReader(s))
 }
 
 func prepareConfigResponse(discoveryID int, discoveryAddress [][]string) string {
@@ -165,19 +75,19 @@ func TestGoodClusterConfigs(t *testing.T) {
 	for _, tt := range configTests {
 		config := prepareConfigResponse(tt.discoveryID, tt.discoveryAddresses)
 		want := buildClusterConfig(tt.discoveryID, tt.discoveryAddresses)
-		reader := newMockNetpollReader(config)
+		reader := newMockReader(config)
 		got := &ClusterConfig{}
 
 		f := func(cb *ClusterConfig) {
 			got = cb
 		}
-		err := parseConfigGetResponseNetpoll(reader, f)
+		err := parseConfigGetResponse(reader, f)
 		if err != nil {
-			t.Errorf("parseConfigGetResponseNetpoll(%v) returned error: %v", config, err)
+			t.Errorf("parseConfigGetResponse(%v) returned error: %v", config, err)
 		}
 
 		if !reflect.DeepEqual(want, got) {
-			t.Errorf("parseConfigGetResponseNetpoll(%v) got: %v, want: %v", config, got, want)
+			t.Errorf("parseConfigGetResponse(%v) got: %v, want: %v", config, got, want)
 		}
 	}
 }
@@ -194,7 +104,7 @@ func TestBrokenClusterConfigs(t *testing.T) {
 	}
 	for _, tt := range brokenConfigTests {
 		t.Run(tt.name, func(t *testing.T) {
-			reader := newMockNetpollReader(tt.config)
+			reader := newMockReader(tt.config)
 
 			var got *ClusterConfig
 
@@ -202,9 +112,9 @@ func TestBrokenClusterConfigs(t *testing.T) {
 				got = cb
 			}
 
-			err := parseConfigGetResponseNetpoll(reader, f)
+			err := parseConfigGetResponse(reader, f)
 			if err == nil && got != nil {
-				t.Errorf("parseConfigGetResponseNetpoll(%v) expected error but got nil with config: %v", tt.config, got)
+				t.Errorf("parseConfigGetResponse(%v) expected error but got nil with config: %v", tt.config, got)
 			}
 		})
 	}
@@ -213,15 +123,15 @@ func TestBrokenClusterConfigs(t *testing.T) {
 func TestEmptyConfigResponse(t *testing.T) {
 	// Test END response (no config found)
 	config := "END\r\n"
-	reader := newMockNetpollReader(config)
+	reader := newMockReader(config)
 	called := false
 
 	f := func(cb *ClusterConfig) {
 		called = true
 	}
-	err := parseConfigGetResponseNetpoll(reader, f)
+	err := parseConfigGetResponse(reader, f)
 	if err != nil {
-		t.Errorf("parseConfigGetResponseNetpoll(%v) returned error: %v", config, err)
+		t.Errorf("parseConfigGetResponse(%v) returned error: %v", config, err)
 	}
 
 	if called {
@@ -232,16 +142,16 @@ func TestEmptyConfigResponse(t *testing.T) {
 func TestEmptyNodesListConfig(t *testing.T) {
 	// Test config with empty nodes list
 	config := "CONFIG cluster 0 10\r\n42\r\n\n\r\n"
-	reader := newMockNetpollReader(config)
+	reader := newMockReader(config)
 
 	var got *ClusterConfig
 
 	f := func(cb *ClusterConfig) {
 		got = cb
 	}
-	err := parseConfigGetResponseNetpoll(reader, f)
+	err := parseConfigGetResponse(reader, f)
 	if err != nil {
-		t.Errorf("parseConfigGetResponseNetpoll(%v) returned error: %v", config, err)
+		t.Errorf("parseConfigGetResponse(%v) returned error: %v", config, err)
 	}
 
 	if got == nil {
@@ -260,16 +170,16 @@ func TestEmptyNodesListConfig(t *testing.T) {
 func TestMultipleNodesConfig(t *testing.T) {
 	// Test config with multiple nodes
 	config := "CONFIG cluster 0 100\r\n123\r\nhost1|host1|11211 host2|host2|11212 host3|host3|11213\n\r\n"
-	reader := newMockNetpollReader(config)
+	reader := newMockReader(config)
 
 	var got *ClusterConfig
 
 	f := func(cb *ClusterConfig) {
 		got = cb
 	}
-	err := parseConfigGetResponseNetpoll(reader, f)
+	err := parseConfigGetResponse(reader, f)
 	if err != nil {
-		t.Errorf("parseConfigGetResponseNetpoll returned error: %v", err)
+		t.Errorf("parseConfigGetResponse returned error: %v", err)
 	}
 
 	if got == nil {
@@ -306,8 +216,8 @@ func BenchmarkParseConfigGetResponse(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		reader := newMockNetpollReader(config)
+		reader := newMockReader(config)
 		//nolint:errcheck
-		parseConfigGetResponseNetpoll(reader, func(cc *ClusterConfig) {})
+		parseConfigGetResponse(reader, func(cc *ClusterConfig) {})
 	}
 }

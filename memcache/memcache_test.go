@@ -118,10 +118,6 @@ func TestFakeServer(t *testing.T) {
 	testWithClient(t, client)
 }
 
-func TestTLS(t *testing.T) {
-	t.Skip("skipping TLS test; netpoll does not support custom TLS dialers")
-}
-
 func mustSetF(t *testing.T, c *Client) func(*Item) {
 	return func(it *Item) {
 		err := c.Set(it)
@@ -399,52 +395,6 @@ func testTouchWithClient(t *testing.T, c *Client) {
 
 	if !errors.Is(err, ErrCacheMiss) {
 		t.Fatalf("unexpected error retrieving bar: %v", err.Error())
-	}
-}
-
-func BenchmarkOnItem(b *testing.B) {
-	fakeServer, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		b.Fatal("Could not open fake server: ", err)
-	}
-
-	defer func() {
-		_ = fakeServer.Close()
-	}()
-
-	go func() {
-		for {
-			if c, err := fakeServer.Accept(); err == nil {
-				go func() {
-					//nolint:errcheck
-					io.Copy(io.Discard, c)
-				}()
-			}
-		}
-	}()
-
-	addr := fakeServer.Addr()
-
-	c, err := New(addr.String())
-	if err != nil {
-		b.Fatal("failed to create client: ", err)
-	}
-
-	res, err := c.acquireConn(addr)
-	if err != nil {
-		b.Fatal("failed to initialize connection to fake server")
-	}
-
-	res.Release()
-
-	item := Item{Key: []byte("foo")}
-	dummyFn := func(_ *Client, _ *conn, _ *Item) error { return nil }
-
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		//nolint:errcheck
-		c.onItem(&item, dummyFn)
 	}
 }
 

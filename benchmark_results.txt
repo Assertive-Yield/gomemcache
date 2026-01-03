@@ -1,0 +1,19 @@
+goos: linux
+goarch: amd64
+pkg: github.com/Assertive-Yield/gomemcache/memcache
+cpu: 13th Gen Intel(R) Core(TM) i9-13900H
+BenchmarkSetGet-20                    	   97802	     34815 ns/op	       0 B/op	       0 allocs/opBenchmarkSet-20                       	  214774	     15506 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGet-20                       	  239518	     14367 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAdd-20                       	  259041	     17507 ns/op	     155 B/op	       4 allocs/op
+BenchmarkSetLargeValue-20             	   39932	     87061 ns/op	   85266 B/op	       2 allocs/op
+BenchmarkGetLargeValue-20             	  105966	     47496 ns/op	       1 B/op	       0 allocs/op
+BenchmarkParallelSet-20               	  308890	     11576 ns/op	     178 B/op	       3 allocs/op
+BenchmarkParallelGet-20               	  336824	     11122 ns/op	     287 B/op	       6 allocs/op
+BenchmarkParseConfigGetResponse-20    	 1600887	      2279 ns/op	    4533 B/op	      13 allocs/op
+BenchmarkScanGetResponseLine-20       	76432812	        42.94 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPickServer-20                	27204558	       151.5 ns/op	     256 B/op	       1 allocs/op
+BenchmarkPickServer_Single-20         	241572544	        14.50 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPickAnyServer-20             	177495157	        20.32 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPickAnyServer_Single-20      	243561675	        14.77 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/Assertive-Yield/gomemcache/memcache	73.742s
