@@ -18,6 +18,7 @@ package memcache
 
 import (
 	"hash/crc32"
+	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -31,7 +32,11 @@ import (
 type ServerSelector interface {
 	// PickServer returns the server address that a given item
 	// should be shared onto.
-	PickServer(key string) (net.Addr, error)
+	PickServer(key []byte) (net.Addr, error)
+	// PickAnyServer returns any active server, preferably not the
+	// same one every time in order to distribute the load.
+	// This can be used to get information which is server agnostic.
+	PickAnyServer() (net.Addr, error)
 	Each(func(net.Addr) error) error
 }
 
@@ -67,63 +72,80 @@ func (s *staticAddr) String() string  { return s.str }
 // is returned, no changes are made to the ServerList.
 func (ss *ServerList) SetServers(servers ...string) error {
 	naddr := make([]net.Addr, len(servers))
+
 	for i, server := range servers {
 		if strings.Contains(server, "/") {
 			addr, err := net.ResolveUnixAddr("unix", server)
 			if err != nil {
 				return err
 			}
+
 			naddr[i] = newStaticAddr(addr)
 		} else {
 			tcpaddr, err := net.ResolveTCPAddr("tcp", server)
 			if err != nil {
 				return err
 			}
+
 			naddr[i] = newStaticAddr(tcpaddr)
 		}
 	}
 
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
+
 	ss.addrs = naddr
+
 	return nil
 }
 
-// Each iterates over each server calling the given function
+// Each iterates over each server calling the given function.
 func (ss *ServerList) Each(f func(net.Addr) error) error {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
+
 	for _, a := range ss.addrs {
-		if err := f(a); nil != err {
+		err := f(a)
+		if err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
-// keyBufPool returns []byte buffers for use by PickServer's call to
-// crc32.ChecksumIEEE to avoid allocations. (but doesn't avoid the
-// copies, which at least are bounded in size and small)
-var keyBufPool = sync.Pool{
-	New: func() interface{} {
-		b := make([]byte, 256)
-		return &b
-	},
-}
-
-func (ss *ServerList) PickServer(key string) (net.Addr, error) {
+func (ss *ServerList) PickServer(key []byte) (net.Addr, error) {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
+
 	if len(ss.addrs) == 0 {
 		return nil, ErrNoServers
 	}
+
 	if len(ss.addrs) == 1 {
 		return ss.addrs[0], nil
 	}
-	bufp := keyBufPool.Get().(*[]byte)
-	n := copy(*bufp, key)
-	cs := crc32.ChecksumIEEE((*bufp)[:n])
-	keyBufPool.Put(bufp)
+	// not sure if we need to make a copy.
+	buf := make([]byte, 256)
+	n := copy(buf, key)
+	cs := crc32.ChecksumIEEE(buf[:n])
 
 	return ss.addrs[cs%uint32(len(ss.addrs))], nil
+}
+
+// PickAnyServer picks any active server.
+// This can be used to get information which is not linked to a key or which could be on any server.
+func (ss *ServerList) PickAnyServer() (net.Addr, error) {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+
+	if len(ss.addrs) == 0 {
+		return nil, ErrNoServers
+	}
+
+	if len(ss.addrs) == 1 {
+		return ss.addrs[0], nil
+	}
+
+	return ss.addrs[rand.Intn(len(ss.addrs))], nil
 }

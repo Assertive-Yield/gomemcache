@@ -50,6 +50,7 @@ func (s *testServer) Serve(l net.Listener) {
 		if err != nil {
 			return
 		}
+
 		tc := &testConn{s: s, c: c}
 		go tc.serve()
 	}
@@ -63,17 +64,24 @@ type testConn struct {
 }
 
 func (c *testConn) serve() {
-	defer c.c.Close()
+	defer func() {
+		_ = c.c.Close()
+	}()
+
 	c.br = bufio.NewReader(c.c)
+
 	c.bw = bufio.NewWriter(c.c)
+
 	for {
 		line, err := c.br.ReadSlice('\n')
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return
 			}
+
 			return
 		}
+
 		if !c.handleRequestLine(string(line)) {
 			panic(fmt.Sprintf("unhandled request line in testServer: %q", line))
 		}
@@ -81,8 +89,14 @@ func (c *testConn) serve() {
 }
 
 func (c *testConn) reply(msg string) bool {
-	fmt.Fprintf(c.bw, "%s\r\n", msg)
-	c.bw.Flush()
+	if _, err := fmt.Fprintf(c.bw, "%s\r\n", msg); err != nil {
+		return false
+	}
+
+	if err := c.bw.Flush(); err != nil {
+		return false
+	}
+
 	return true
 }
 
@@ -104,24 +118,37 @@ func (c *testConn) handleRequestLine(line string) bool {
 		return c.reply("VERSION go-client-unit-test")
 	case "flush_all\r\n":
 		c.s.m = make(map[string]serverItem)
+
 		return c.reply("OK")
 	}
 
-	if strings.HasPrefix(line, "gets ") {
-		keys := strings.Fields(strings.TrimPrefix(line, "gets "))
+	if after, ok := strings.CutPrefix(line, "gets "); ok {
+		keys := strings.Fields(after)
 		for _, key := range keys {
 			item, ok := c.s.m[key]
 			if !ok {
 				continue
 			}
+
 			if !item.exp.IsZero() && item.exp.Before(time.Now()) {
 				delete(c.s.m, key)
+
 				continue
 			}
-			fmt.Fprintf(c.bw, "VALUE %s %d %d %d\r\n", key, item.flags, len(item.data), item.casUniq)
-			c.bw.Write(item.data)
-			c.bw.Write(crlf)
+
+			if _, err := fmt.Fprintf(c.bw, "VALUE %s %d %d %d\r\n", key, item.flags, len(item.data), item.casUniq); err != nil {
+				return false
+			}
+
+			if _, err := c.bw.Write(item.data); err != nil {
+				return false
+			}
+
+			if _, err := c.bw.Write(crlf); err != nil {
+				return false
+			}
 		}
+
 		return c.reply("END")
 	}
 
@@ -129,13 +156,16 @@ func (c *testConn) handleRequestLine(line string) bool {
 		key, noReply := m[1], strings.TrimSpace(m[2])
 		len0 := len(c.s.m)
 		delete(c.s.m, key)
+
 		len1 := len(c.s.m)
 		if noReply == "" {
 			if len0 == len1 {
 				return c.reply("NOT_FOUND")
 			}
+
 			return c.reply("DELETED")
 		}
+
 		return true
 	}
 
@@ -148,13 +178,15 @@ func (c *testConn) handleRequestLine(line string) bool {
 			item.exp = computeExpTime(exptimeVal)
 			c.s.m[key] = item
 		}
+
 		if noReply == "" {
 			if ok {
 				return c.reply("TOUCHED")
-			} else {
-				return c.reply("NOT_FOUND")
 			}
+
+			return c.reply("NOT_FOUND")
 		}
+
 		return true
 	}
 
@@ -163,76 +195,98 @@ func (c *testConn) handleRequestLine(line string) bool {
 		flags, _ := strconv.ParseUint(flagsStr, 10, 32)
 		exptimeVal, _ := strconv.ParseInt(exptimeStr, 10, 64)
 		itemLen, _ := strconv.ParseInt(lenStr, 10, 32)
-		//log.Printf("got %q flags=%q exp=%d %d len=%d cas=%q noreply=%q", verb, key, flags, exptimeVal, itemLen, casUniq, noReply)
+
 		if c.s.m == nil {
 			c.s.m = make(map[string]serverItem)
 		}
+
 		reply := func(msg string) bool {
 			if noReply != "noreply" {
 				c.reply(msg)
 			}
+
 			return true
 		}
+
 		body := make([]byte, itemLen+2)
 		if _, err := io.ReadFull(c.br, body); err != nil {
 			log.Printf("error reading %q body for key %q: %v", verb, key, err)
+
 			return false
 		}
+
 		if !bytes.HasSuffix(body, []byte("\r\n")) {
 			log.Printf("missing \\r\\n suffix for %q body for key %q", verb, key)
+
 			return false
 		}
 
 		was, ok := c.s.m[key]
 		if ok && (was.exp.After(time.Now()) || exptimeVal < 0) {
 			delete(c.s.m, key)
+
 			ok = false
 		}
+
 		c.s.nextCas++
+
 		newItem := serverItem{
 			flags:   uint32(flags),
 			data:    body[:itemLen],
 			casUniq: c.s.nextCas,
 			exp:     computeExpTime(exptimeVal),
 		}
+
 		switch verb {
 		case "set":
 			c.s.m[key] = newItem
+
 			return reply("STORED")
 		case "add":
 			if ok {
 				return reply("NOT_STORED")
 			}
+
 			c.s.m[key] = newItem
+
 			return reply("STORED")
 		case "replace":
 			if !ok {
 				return reply("NOT_STORED")
 			}
+
 			c.s.m[key] = newItem
+
 			return reply("STORED")
 		case "cas":
 			if !ok {
 				reply("NOT_FOUND")
 			}
-			if casUniq != fmt.Sprint(was.casUniq) {
+
+			if casUniq != strconv.FormatUint(was.casUniq, 10) {
 				return reply("EXISTS")
 			}
+
 			c.s.m[key] = newItem
+
 			return reply("STORED")
 		case "append":
 			if !ok {
 				return reply("NOT_STORED")
 			}
+
 			newItem.data = bytes.Join([][]byte{was.data, newItem.data}, nil)
 			c.s.m[key] = newItem
+
 			return reply("STORED")
 		case "prepend":
 			if !ok {
 				return reply("NOT_STORED")
 			}
+
 			newItem.data = bytes.Join([][]byte{newItem.data, was.data}, nil)
 			c.s.m[key] = newItem
+
 			return reply("STORED")
 		}
 	}
@@ -244,17 +298,23 @@ func (c *testConn) handleRequestLine(line string) bool {
 			if noReply != "noreply" {
 				c.reply(msg)
 			}
+
 			return true
 		}
+
 		item, ok := c.s.m[key]
+
 		if !ok {
 			return reply("NOT_FOUND")
 		}
+
 		oldVal, err := strconv.ParseInt(string(item.data), 10, 64)
 		if err != nil {
 			return reply("CLIENT_ERROR cannot increment or decrement non-numeric value")
 		}
+
 		var newVal int64
+
 		if verb == "decr" {
 			if delta < oldVal {
 				newVal = oldVal - delta
@@ -264,25 +324,34 @@ func (c *testConn) handleRequestLine(line string) bool {
 		} else {
 			newVal = oldVal + delta
 		}
+
 		item.data = []byte(strconv.FormatInt(newVal, 10))
+
 		c.s.m[key] = item
 		if noReply == "" {
-			fmt.Fprintf(c.bw, "%d\r\n", newVal)
-			c.bw.Flush()
+			if _, err := fmt.Fprintf(c.bw, "%d\r\n", newVal); err != nil {
+				return false
+			}
+
+			if err := c.bw.Flush(); err != nil {
+				return false
+			}
 		}
+
 		return true
 	}
 
 	return false
-
 }
 
 func computeExpTime(n int64) time.Time {
 	if n == 0 {
 		return time.Time{}
 	}
+
 	if n <= 60*60*24*30 {
 		return time.Now().Add(time.Duration(n) * time.Second)
 	}
+
 	return time.Unix(n, 0)
 }
