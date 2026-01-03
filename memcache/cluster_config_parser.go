@@ -17,12 +17,11 @@ limitations under the License.
 package memcache
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
 	"strconv"
-
-	"github.com/cloudwego/netpoll"
 )
 
 var (
@@ -49,42 +48,29 @@ type ClusterConfig struct {
 	NodeAddresses []ClusterNode
 }
 
-// parseConfigGetResponseNetpoll reads a CONFIG GET response using netpoll's nocopy Reader API.
-func parseConfigGetResponseNetpoll(r netpoll.Reader, cb func(*ClusterConfig)) error {
+// parseConfigGetResponse reads a CONFIG GET response using bufio.Reader.
+func parseConfigGetResponse(r *bufio.Reader, cb func(*ClusterConfig)) error {
 	var clusterConfig ClusterConfig
 	// Reset the config for reuse
 	clusterConfig.ConfigID = 0
 	clusterConfig.NodeAddresses = clusterConfig.NodeAddresses[:0]
 
 	for {
-		line, err := r.Until('\n')
+		line, err := r.ReadBytes('\n')
 		if err != nil {
-			_ = r.Release()
-
 			return err
 		}
 
 		line = bytes.TrimSpace(line)
 		// Skip empty line
 		if len(line) == 0 {
-			err := r.Release()
-			if err != nil {
-				return err
-			}
-
 			continue
 		}
 		// CONFIG keyword line is expected
 		if bytes.Contains(line, configKeywordBytes) {
-			if err := r.Release(); err != nil {
-				return err
-			}
-
 			// Read config ID line
-			configIDLine, err := r.Until('\n')
+			configIDLine, err := r.ReadBytes('\n')
 			if err != nil {
-				_ = r.Release()
-
 				return ErrInvalidConfig
 			}
 
@@ -92,40 +78,26 @@ func parseConfigGetResponseNetpoll(r netpoll.Reader, cb func(*ClusterConfig)) er
 
 			configID, err := strconv.ParseInt(string(configIDLine), 10, 64)
 			if err != nil {
-				_ = r.Release()
-
 				return fmt.Errorf("memcache: failed to parse config id: %w", err)
 			}
 
 			clusterConfig.ConfigID = configID
 
-			if err := r.Release(); err != nil {
-				return err
-			}
-
 			// Read nodes line
-			nodesLine, err := r.Until('\n')
+			nodesLine, err := r.ReadBytes('\n')
 			if err != nil {
-				_ = r.Release()
-
 				return ErrInvalidConfig
 			}
 
 			nodesLine = bytes.TrimSpace(nodesLine)
 
 			if len(nodesLine) == 0 {
-				_ = r.Release()
-
 				cb(&clusterConfig)
-
 				return nil
 			}
 
-			// Parse nodes - make a copy since we'll release the buffer
-			nodesCopy := make([]byte, len(nodesLine))
-			copy(nodesCopy, nodesLine)
-
-			_ = r.Release()
+			// Parse nodes
+			nodesCopy := nodesLine
 
 			for len(nodesCopy) > 0 {
 				spaceIdx := bytes.IndexByte(nodesCopy, ' ')
@@ -177,13 +149,7 @@ func parseConfigGetResponseNetpoll(r netpoll.Reader, cb func(*ClusterConfig)) er
 		}
 		// Check for END response (no config found)
 		if bytes.Equal(line, endBytes) {
-			_ = r.Release()
-
 			return nil
-		}
-
-		if err := r.Release(); err != nil {
-			return err
 		}
 	}
 }
