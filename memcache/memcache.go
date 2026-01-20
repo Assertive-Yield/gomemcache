@@ -546,11 +546,6 @@ func (cn *conn) rw() *bufio.ReadWriter {
 	return cn.cr.rw
 }
 
-// nc returns the underlying net.Conn for this connection.
-func (cn *conn) nc() net.Conn {
-	return cn.cr.nc
-}
-
 // setDeadlines sets both read and write deadlines on the connection.
 // Use this when you need both operations to have the same timeout.
 func (cn *conn) setDeadlines() {
@@ -645,7 +640,8 @@ func (c *Client) getPool(addr net.Addr) (*puddle.Pool[*connResource], error) {
 			// Call afterConnect callback
 			if c.afterConnect != nil {
 				if err := c.afterConnect(ctx, nc); err != nil {
-					nc.Close()
+					//nolint:errcheck
+					_ = nc.Close()
 					return nil, err
 				}
 			}
