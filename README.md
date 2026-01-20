@@ -8,10 +8,11 @@ A high-performance [memcached](https://memcached.org/) client library for [Go](h
 
 - **Production Ready**: Battle-tested and used in production environments
 - **Full Protocol Support**: Implements the complete memcache protocol
-- **Connection Pooling**: Efficient connection management with configurable pooling
+- **Advanced Connection Pooling**: Efficient connection management with configurable pool size, lifetime, health checks, and lifecycle callbacks
 - **Cluster Support**: Automatic sharding across multiple memcached servers
 - **Auto-Discovery**: Support for AWS ElastiCache, GCP Memorystore and other cluster configurations
 - **High Performance**: Optimized for speed with minimal allocations
+- **Pool Statistics**: Monitor connection pool health with detailed statistics
 
 ## Installation
 
@@ -104,7 +105,7 @@ if err == memcache.ErrCASConflict {
 }
 ```
 
-### Configuration
+### Basic Configuration
 
 ```go
 mc, err := memcache.New("localhost:11211")
@@ -114,9 +115,88 @@ if err != nil {
 
 // Set timeout for network operations
 mc.Timeout = 100 * time.Millisecond
+```
 
-// Set maximum idle connections per server
-mc.MaxIdleConns = 10
+### Advanced Pool Configuration
+
+For fine-grained control over connection pooling, use `NewConfig` and `NewWithConfig`:
+
+```go
+import (
+    "context"
+    "net"
+    "time"
+    "github.com/Assertive-Yield/gomemcache/memcache"
+)
+
+// Create configuration with default values
+config := memcache.NewConfig("localhost:11211", "localhost:11212")
+
+// Customize pool settings
+config.Timeout = 100 * time.Millisecond
+config.MaxConns = 20                        // Maximum connections per server (default: max(4, NumCPU))
+config.MinConns = 2                         // Minimum connections per server (default: 0)
+config.MaxConnLifetime = 30 * time.Minute   // Connection max lifetime (default: 1 hour)
+config.MaxConnLifetimeJitter = 5 * time.Minute // Random jitter to prevent thundering herd
+config.MaxConnIdleTime = 10 * time.Minute   // Max idle time before closing (default: 30 minutes)
+config.HealthCheckPeriod = 30 * time.Second // Health check interval (default: 1 minute)
+
+// Optional lifecycle callbacks
+config.BeforeConnect = func(ctx context.Context, addr net.Addr) error {
+    // Called before establishing a new connection
+    return nil
+}
+
+config.AfterConnect = func(ctx context.Context, conn net.Conn) error {
+    // Called after connection is established
+    return nil
+}
+
+config.BeforeAcquire = func(ctx context.Context, conn net.Conn) bool {
+    // Return true to allow acquisition, false to destroy and get another connection
+    return true
+}
+
+config.AfterRelease = func(conn net.Conn) bool {
+    // Return true to return to pool, false to destroy
+    return true
+}
+
+config.BeforeClose = func(conn net.Conn) {
+    // Called before a connection is closed
+}
+
+// Create client with configuration
+mc, err := memcache.NewWithConfig(config)
+if err != nil {
+    panic(err)
+}
+defer mc.Close()
+```
+
+### Pool Statistics
+
+Monitor connection pool health with statistics:
+
+```go
+stats := mc.Stat()
+
+fmt.Printf("Acquired connections: %d\n", stats.AcquiredConns())
+fmt.Printf("Idle connections: %d\n", stats.IdleConns())
+fmt.Printf("Total connections: %d\n", stats.TotalConns())
+fmt.Printf("Max connections: %d\n", stats.MaxConns())
+fmt.Printf("New connections created: %d\n", stats.NewConnsCount())
+fmt.Printf("Connections closed (lifetime): %d\n", stats.MaxLifetimeDestroyCount())
+fmt.Printf("Connections closed (idle): %d\n", stats.MaxIdleDestroyCount())
+```
+
+### Pool Reset
+
+Reset all connections without closing the client (useful for handling network disruptions):
+
+```go
+// Close all connections but keep client open
+mc.Reset()
 ```
 
 ### Error Handling
