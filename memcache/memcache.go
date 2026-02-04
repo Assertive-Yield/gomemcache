@@ -25,10 +25,13 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand"
 	"net"
+	"runtime"
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -83,6 +86,15 @@ const (
 	// DefaultMaxIdleConns is the default maximum number of idle connections
 	// kept for any single address.
 	DefaultMaxIdleConns = 2
+)
+
+// Pool configuration defaults
+var (
+	defaultMaxConns          = int32(200)
+	defaultMinConns          = int32(100)
+	defaultMaxConnLifetime   = time.Hour
+	defaultMaxConnIdleTime   = time.Minute * 30
+	defaultHealthCheckPeriod = time.Minute
 )
 
 const buffered = 8 // arbitrary buffered channel size, for readability
@@ -141,7 +153,107 @@ func New(server ...string) (*Client, error) {
 
 // NewFromSelector returns a new Client using the provided ServerSelector.
 func NewFromSelector(ss ServerSelector) *Client {
-	return &Client{selector: ss}
+	return &Client{
+		selector:          ss,
+		maxConns:          defaultMaxConns,
+		minConns:          defaultMinConns,
+		maxConnLifetime:   defaultMaxConnLifetime,
+		maxConnIdleTime:   defaultMaxConnIdleTime,
+		healthCheckPeriod: defaultHealthCheckPeriod,
+		healthCheckChan:   make(chan struct{}, 1),
+		closeChan:         make(chan struct{}),
+	}
+}
+
+// NewWithConfig creates a new Client with the provided configuration.
+// config must have been created by NewConfig.
+func NewWithConfig(config *Config) (*Client, error) {
+	if !config.createdByNewConfig {
+		panic("config must be created by NewConfig")
+	}
+
+	ss := new(ServerList)
+	err := ss.SetServers(config.Servers...)
+	if err != nil {
+		return nil, err
+	}
+
+	c := &Client{
+		selector:              ss,
+		Timeout:               config.Timeout,
+		config:                config,
+		beforeConnect:         config.BeforeConnect,
+		afterConnect:          config.AfterConnect,
+		beforeAcquire:         config.BeforeAcquire,
+		afterRelease:          config.AfterRelease,
+		beforeClose:           config.BeforeClose,
+		minConns:              config.MinConns,
+		maxConns:              config.MaxConns,
+		maxConnLifetime:       config.MaxConnLifetime,
+		maxConnLifetimeJitter: config.MaxConnLifetimeJitter,
+		maxConnIdleTime:       config.MaxConnIdleTime,
+		healthCheckPeriod:     config.HealthCheckPeriod,
+		healthCheckChan:       make(chan struct{}, 1),
+		closeChan:             make(chan struct{}),
+	}
+
+	// Start background health check if health check period is set
+	if c.healthCheckPeriod > 0 {
+		go c.backgroundHealthCheck()
+	}
+
+	return c, nil
+}
+
+// Config returns a copy of config that was used to initialize this client.
+// Returns nil if the client was not created with NewWithConfig.
+func (c *Client) Config() *Config {
+	if c.config == nil {
+		return nil
+	}
+	return c.config.Copy()
+}
+
+// Stat returns a Stat struct with a snapshot of pool statistics for all servers.
+// Note: This aggregates stats across all server pools.
+func (c *Client) Stat() *Stat {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Aggregate stats from all pools
+	var totalStat *puddle.Stat
+	for _, pool := range c.pools {
+		if totalStat == nil {
+			s := pool.Stat()
+			totalStat = s
+		}
+		// Note: puddle.Stat doesn't support aggregation, so we return first pool's stat
+		// For more detailed stats, use StatForServer
+	}
+
+	if totalStat == nil {
+		totalStat = &puddle.Stat{}
+	}
+
+	return &Stat{
+		s:                    totalStat,
+		newConnsCount:        atomic.LoadInt64(&c.newConnsCount),
+		lifetimeDestroyCount: atomic.LoadInt64(&c.lifetimeDestroyCount),
+		idleDestroyCount:     atomic.LoadInt64(&c.idleDestroyCount),
+	}
+}
+
+// Reset closes all connections, but leaves the client open. It is intended for use when an error is detected that would
+// disrupt all connections (such as a network interruption or a server state change).
+//
+// It is safe to reset the client while connections are checked out. Those connections will be closed when they are returned
+// to the pool.
+func (c *Client) Reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, pool := range c.pools {
+		pool.Reset()
+	}
 }
 
 // stop is a function type for stopping the discovery polling
@@ -175,6 +287,168 @@ func newDiscoveryClient(discoveryAddress string, pollingDuration time.Duration) 
 	return mcClient, nil
 }
 
+// Config is the configuration struct for creating a Client with pool settings.
+// It must be created by NewConfig and then it can be modified.
+type Config struct {
+	// Servers is the list of memcache server addresses.
+	Servers []string
+
+	// Timeout specifies the socket read/write timeout.
+	// If zero, DefaultTimeout is used.
+	Timeout time.Duration
+
+	// BeforeConnect is called before a new connection is made. It is passed a copy of the address.
+	// If this returns an error, the connection attempt fails.
+	BeforeConnect func(context.Context, net.Addr) error
+
+	// AfterConnect is called after a connection is established, but before it is added to the pool.
+	// It can be used to perform initial setup on the connection.
+	AfterConnect func(context.Context, net.Conn) error
+
+	// BeforeAcquire is called before a connection is acquired from the pool. It must return true to allow the
+	// acquisition or false to indicate that the connection should be destroyed and a different connection should be
+	// acquired.
+	BeforeAcquire func(context.Context, net.Conn) bool
+
+	// AfterRelease is called after a connection is released, but before it is returned to the pool. It must return true to
+	// return the connection to the pool or false to destroy the connection.
+	AfterRelease func(net.Conn) bool
+
+	// BeforeClose is called right before a connection is closed and removed from the pool.
+	BeforeClose func(net.Conn)
+
+	// MaxConnLifetime is the duration since creation after which a connection will be automatically closed.
+	MaxConnLifetime time.Duration
+
+	// MaxConnLifetimeJitter is the duration after MaxConnLifetime to randomly decide to close a connection.
+	// This helps prevent all connections from being closed at the exact same time, starving the pool.
+	MaxConnLifetimeJitter time.Duration
+
+	// MaxConnIdleTime is the duration after which an idle connection will be automatically closed by the health check.
+	MaxConnIdleTime time.Duration
+
+	// MaxConns is the maximum size of the pool per server. The default is the greater of 4 or runtime.NumCPU().
+	MaxConns int32
+
+	// MinConns is the minimum size of the pool per server. After connection closes, the pool might dip below MinConns. A low
+	// number of MinConns might mean the pool is empty after MaxConnLifetime until the health check has a chance
+	// to create new connections.
+	MinConns int32
+
+	// HealthCheckPeriod is the duration between checks of the health of idle connections.
+	HealthCheckPeriod time.Duration
+
+	createdByNewConfig bool // Used to enforce created by NewConfig rule.
+}
+
+// NewConfig creates a new Config with default values.
+// The returned Config can be modified before passing to NewWithConfig.
+func NewConfig(servers ...string) *Config {
+	maxConns := defaultMaxConns
+	if numCPU := int32(runtime.NumCPU()); numCPU > maxConns {
+		maxConns = numCPU
+	}
+
+	return &Config{
+		Servers:            servers,
+		Timeout:            DefaultTimeout,
+		MaxConns:           maxConns,
+		MinConns:           defaultMinConns,
+		MaxConnLifetime:    defaultMaxConnLifetime,
+		MaxConnIdleTime:    defaultMaxConnIdleTime,
+		HealthCheckPeriod:  defaultHealthCheckPeriod,
+		createdByNewConfig: true,
+	}
+}
+
+// Copy returns a deep copy of the config that is safe to use and modify.
+func (c *Config) Copy() *Config {
+	newConfig := new(Config)
+	*newConfig = *c
+	if c.Servers != nil {
+		newConfig.Servers = make([]string, len(c.Servers))
+		copy(newConfig.Servers, c.Servers)
+	}
+	return newConfig
+}
+
+// connResource wraps a connection for pool management
+type connResource struct {
+	nc         net.Conn
+	rw         *bufio.ReadWriter
+	addr       net.Addr
+	maxAgeTime time.Time
+}
+
+// Stat is a snapshot of pool statistics.
+type Stat struct {
+	s                    *puddle.Stat
+	newConnsCount        int64
+	lifetimeDestroyCount int64
+	idleDestroyCount     int64
+}
+
+// AcquireCount returns the cumulative count of successful acquires from the pool.
+func (s *Stat) AcquireCount() int64 {
+	return s.s.AcquireCount()
+}
+
+// AcquireDuration returns the total duration of all successful acquires from the pool.
+func (s *Stat) AcquireDuration() time.Duration {
+	return s.s.AcquireDuration()
+}
+
+// AcquiredConns returns the number of currently acquired connections in the pool.
+func (s *Stat) AcquiredConns() int32 {
+	return s.s.AcquiredResources()
+}
+
+// CanceledAcquireCount returns the cumulative count of acquires from the pool that were canceled.
+func (s *Stat) CanceledAcquireCount() int64 {
+	return s.s.CanceledAcquireCount()
+}
+
+// ConstructingConns returns the number of conns with construction in progress in the pool.
+func (s *Stat) ConstructingConns() int32 {
+	return s.s.ConstructingResources()
+}
+
+// EmptyAcquireCount returns the cumulative count of successful acquires from the pool
+// that waited for a resource to be released or constructed because the pool was empty.
+func (s *Stat) EmptyAcquireCount() int64 {
+	return s.s.EmptyAcquireCount()
+}
+
+// IdleConns returns the number of currently idle conns in the pool.
+func (s *Stat) IdleConns() int32 {
+	return s.s.IdleResources()
+}
+
+// MaxConns returns the maximum size of the pool.
+func (s *Stat) MaxConns() int32 {
+	return s.s.MaxResources()
+}
+
+// TotalConns returns the total number of resources currently in the pool.
+func (s *Stat) TotalConns() int32 {
+	return s.s.TotalResources()
+}
+
+// NewConnsCount returns the cumulative count of new connections opened.
+func (s *Stat) NewConnsCount() int64 {
+	return s.newConnsCount
+}
+
+// MaxLifetimeDestroyCount returns the cumulative count of connections destroyed because they exceeded MaxConnLifetime.
+func (s *Stat) MaxLifetimeDestroyCount() int64 {
+	return s.lifetimeDestroyCount
+}
+
+// MaxIdleDestroyCount returns the cumulative count of connections destroyed because they exceeded MaxConnIdleTime.
+func (s *Stat) MaxIdleDestroyCount() int64 {
+	return s.idleDestroyCount
+}
+
 // Client is a memcache client.
 // It is safe for unlocked use by multiple concurrent goroutines.
 type Client struct {
@@ -195,8 +469,36 @@ type Client struct {
 	// StopPolling stops the discovery polling. Only set for discovery-enabled clients.
 	StopPolling stop
 
+	// Pool configuration
+	config *Config
+
+	// Pool callbacks
+	beforeConnect func(context.Context, net.Addr) error
+	afterConnect  func(context.Context, net.Conn) error
+	beforeAcquire func(context.Context, net.Conn) bool
+	afterRelease  func(net.Conn) bool
+	beforeClose   func(net.Conn)
+
+	// Pool settings
+	minConns              int32
+	maxConns              int32
+	maxConnLifetime       time.Duration
+	maxConnLifetimeJitter time.Duration
+	maxConnIdleTime       time.Duration
+	healthCheckPeriod     time.Duration
+
+	// Pool statistics
+	newConnsCount        int64
+	lifetimeDestroyCount int64
+	idleDestroyCount     int64
+
+	// Health check channels
+	healthCheckChan chan struct{}
+	closeOnce       sync.Once
+	closeChan       chan struct{}
+
 	mu    sync.Mutex
-	pools map[string]*puddle.Pool[*conn]
+	pools map[string]*puddle.Pool[*connResource]
 }
 
 // Item is an item to be got or stored in a memcached server.
@@ -232,12 +534,16 @@ func (it *Item) Reset() {
 	it.CasID = 0
 }
 
-// conn is a connection to a server.
+// conn is a connection wrapper for operations.
 type conn struct {
-	nc   net.Conn
-	rw   *bufio.ReadWriter
-	addr net.Addr
-	c    *Client
+	cr  *connResource
+	res *puddle.Resource[*connResource]
+	c   *Client
+}
+
+// rw returns the buffered reader/writer for this connection.
+func (cn *conn) rw() *bufio.ReadWriter {
+	return cn.cr.rw
 }
 
 // setDeadlines sets both read and write deadlines on the connection.
@@ -245,53 +551,120 @@ type conn struct {
 func (cn *conn) setDeadlines() {
 	timeout := cn.c.netTimeout()
 	//nolint:errcheck
-	cn.nc.SetDeadline(time.Now().Add(timeout))
+	cn.cr.nc.SetDeadline(time.Now().Add(timeout))
 }
 
 // condRelease releases this connection back to the puddle pool unless the
 // error is non-resumable, in which case the resource is destroyed.
-func (cn *conn) condRelease(res *puddle.Resource[*conn], err error) {
-	if err == nil || resumableError(err) {
-		// Clear both read and write deadlines before returning to pool.
-		// This prevents idle connections from expiring while sitting in the pool
-		// and avoids stale deadline issues on connection reuse.
-		//nolint:errcheck
-		cn.nc.SetReadDeadline(time.Time{})
-		//nolint:errcheck
-		cn.nc.SetWriteDeadline(time.Time{})
-		res.Release()
+func (cn *conn) condRelease(err error) {
+	if cn.res == nil {
 		return
 	}
-	res.Destroy()
+
+	res := cn.res
+	cn.res = nil
+
+	// Check if connection should be destroyed
+	if cn.cr.nc == nil || !resumableError(err) && err != nil {
+		if cn.c.beforeClose != nil {
+			cn.c.beforeClose(cn.cr.nc)
+		}
+		res.Destroy()
+		cn.c.triggerHealthCheck()
+		return
+	}
+
+	// Check if connection has exceeded its lifetime
+	if cn.c.isExpired(res) {
+		atomic.AddInt64(&cn.c.lifetimeDestroyCount, 1)
+		if cn.c.beforeClose != nil {
+			cn.c.beforeClose(cn.cr.nc)
+		}
+		res.Destroy()
+		cn.c.triggerHealthCheck()
+		return
+	}
+
+	// Check afterRelease callback
+	if cn.c.afterRelease != nil && !cn.c.afterRelease(cn.cr.nc) {
+		if cn.c.beforeClose != nil {
+			cn.c.beforeClose(cn.cr.nc)
+		}
+		res.Destroy()
+		cn.c.triggerHealthCheck()
+		return
+	}
+
+	// Clear both read and write deadlines before returning to pool.
+	// This prevents idle connections from expiring while sitting in the pool
+	// and avoids stale deadline issues on connection reuse.
+	//nolint:errcheck
+	cn.cr.nc.SetReadDeadline(time.Time{})
+	//nolint:errcheck
+	cn.cr.nc.SetWriteDeadline(time.Time{})
+	res.Release()
 }
 
-func (c *Client) getPool(addr net.Addr) (*puddle.Pool[*conn], error) {
+func (c *Client) getPool(addr net.Addr) (*puddle.Pool[*connResource], error) {
 	key := addr.String()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.pools == nil {
-		c.pools = make(map[string]*puddle.Pool[*conn])
+		c.pools = make(map[string]*puddle.Pool[*connResource])
 	}
 	if pool, ok := c.pools[key]; ok {
 		return pool, nil
 	}
-	pool, err := puddle.NewPool(&puddle.Config[*conn]{
-		Constructor: func(ctx context.Context) (*conn, error) {
+
+	maxSize := c.maxConns
+	if maxSize <= 0 {
+		maxSize = int32(c.maxIdleConns())
+	}
+
+	pool, err := puddle.NewPool(&puddle.Config[*connResource]{
+		Constructor: func(ctx context.Context) (*connResource, error) {
+			atomic.AddInt64(&c.newConnsCount, 1)
+
+			// Call beforeConnect callback
+			if c.beforeConnect != nil {
+				if err := c.beforeConnect(ctx, addr); err != nil {
+					return nil, err
+				}
+			}
+
 			nc, err := c.dial(addr)
 			if err != nil {
 				return nil, err
 			}
-			return &conn{
-				nc:   nc,
-				rw:   bufio.NewReadWriter(bufio.NewReader(nc), bufio.NewWriter(nc)),
-				addr: addr,
-				c:    c,
+
+			// Call afterConnect callback
+			if c.afterConnect != nil {
+				if err := c.afterConnect(ctx, nc); err != nil {
+					//nolint:errcheck
+					_ = nc.Close()
+					return nil, err
+				}
+			}
+
+			// Calculate max age time with jitter
+			//nolint:gosec // rand is not used for security purposes
+			jitterSecs := rand.Float64() * c.maxConnLifetimeJitter.Seconds()
+			maxAgeTime := time.Now().Add(c.maxConnLifetime).Add(time.Duration(jitterSecs) * time.Second)
+
+			return &connResource{
+				nc:         nc,
+				rw:         bufio.NewReadWriter(bufio.NewReader(nc), bufio.NewWriter(nc)),
+				addr:       addr,
+				maxAgeTime: maxAgeTime,
 			}, nil
 		},
-		Destructor: func(cn *conn) {
-			_ = cn.nc.Close()
+		Destructor: func(cr *connResource) {
+			if c.beforeClose != nil {
+				c.beforeClose(cr.nc)
+			}
+			_ = cr.nc.Close()
 		},
-		MaxSize: int32(c.maxIdleConns()),
+		MaxSize: maxSize,
 	})
 	if err != nil {
 		return nil, err
@@ -300,23 +673,214 @@ func (c *Client) getPool(addr net.Addr) (*puddle.Pool[*conn], error) {
 	return pool, nil
 }
 
-func (c *Client) acquireConn(addr net.Addr) (*puddle.Resource[*conn], error) {
+// isExpired checks if a connection resource has exceeded its maximum lifetime
+func (c *Client) isExpired(res *puddle.Resource[*connResource]) bool {
+	return time.Now().After(res.Value().maxAgeTime)
+}
+
+// triggerHealthCheck signals the health check goroutine to run
+func (c *Client) triggerHealthCheck() {
+	go func() {
+		// Destroy is asynchronous so we give it time to actually remove itself from
+		// the pool otherwise we might try to check the pool size too soon
+		time.Sleep(500 * time.Millisecond)
+		select {
+		case c.healthCheckChan <- struct{}{}:
+		default:
+		}
+	}()
+}
+
+// backgroundHealthCheck runs periodic health checks on idle connections
+func (c *Client) backgroundHealthCheck() {
+	ticker := time.NewTicker(c.healthCheckPeriod)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.closeChan:
+			return
+		case <-c.healthCheckChan:
+			c.checkHealth()
+		case <-ticker.C:
+			c.checkHealth()
+		}
+	}
+}
+
+// checkHealth performs health check on all pools
+func (c *Client) checkHealth() {
+	for {
+		// If checkMinConns failed we don't destroy any connections since we couldn't
+		// even get to minConns
+		if err := c.checkMinConns(); err != nil {
+			break
+		}
+		if !c.checkConnsHealth() {
+			// Since we didn't destroy any connections we can stop looping
+			break
+		}
+		// Technically Destroy is asynchronous but 500ms should be enough for it to
+		// remove it from the underlying pool
+		select {
+		case <-c.closeChan:
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// checkConnsHealth checks all idle connections and destroys those that are expired or idle too long
+func (c *Client) checkConnsHealth() bool {
+	c.mu.Lock()
+	pools := make([]*puddle.Pool[*connResource], 0, len(c.pools))
+	for _, pool := range c.pools {
+		pools = append(pools, pool)
+	}
+	c.mu.Unlock()
+
+	var destroyed bool
+	for _, pool := range pools {
+		totalConns := pool.Stat().TotalResources()
+		resources := pool.AcquireAllIdle()
+		for _, res := range resources {
+			// We're okay going under minConns if the lifetime is up
+			if c.isExpired(res) && totalConns >= c.minConns {
+				atomic.AddInt64(&c.lifetimeDestroyCount, 1)
+				res.Destroy()
+				destroyed = true
+				totalConns--
+			} else if res.IdleDuration() > c.maxConnIdleTime && totalConns > c.minConns {
+				atomic.AddInt64(&c.idleDestroyCount, 1)
+				res.Destroy()
+				destroyed = true
+				totalConns--
+			} else {
+				res.ReleaseUnused()
+			}
+		}
+	}
+	return destroyed
+}
+
+// checkMinConns ensures minimum connections are maintained in all pools
+func (c *Client) checkMinConns() error {
+	c.mu.Lock()
+	pools := make([]*puddle.Pool[*connResource], 0, len(c.pools))
+	for _, pool := range c.pools {
+		pools = append(pools, pool)
+	}
+	c.mu.Unlock()
+
+	for _, pool := range pools {
+		toCreate := c.minConns - pool.Stat().TotalResources()
+		if toCreate > 0 {
+			if err := c.createIdleResources(pool, int(toCreate)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// createIdleResources creates idle resources in the pool
+func (c *Client) createIdleResources(pool *puddle.Pool[*connResource], targetResources int) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errs := make(chan error, targetResources)
+
+	for i := 0; i < targetResources; i++ {
+		go func() {
+			res, err := pool.Acquire(ctx)
+			if err == nil {
+				res.Release()
+			}
+			// Ignore ErrNotAvailable since that just means the pool is full
+			if err == puddle.ErrNotAvailable {
+				err = nil
+			}
+			errs <- err
+		}()
+	}
+
+	var firstError error
+	for i := 0; i < targetResources; i++ {
+		err := <-errs
+		if err != nil && firstError == nil {
+			cancel()
+			firstError = err
+		}
+	}
+	return firstError
+}
+
+func (c *Client) acquireConn(addr net.Addr) (*conn, error) {
 	pool, err := c.getPool(addr)
 	if err != nil {
 		return nil, err
 	}
-	// todo get from input
-	res, err := pool.Acquire(context.Background())
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, &ConnectTimeoutError{addr}
+
+	for {
+		// todo get from input
+		res, err := pool.Acquire(context.Background())
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, &ConnectTimeoutError{Addr: addr, Timeout: c.netTimeout()}
+			}
+			return nil, fmt.Errorf("acquire: %w", err)
 		}
-		return nil, err
+
+		cr := res.Value()
+
+		// If connection has been idle for more than a second, ping to verify it's still alive
+		if res.IdleDuration() > time.Second {
+			// Quick check if connection is still valid
+			if err := c.pingConn(cr); err != nil {
+				res.Destroy()
+				continue
+			}
+		}
+
+		// Check beforeAcquire callback
+		if c.beforeAcquire != nil && !c.beforeAcquire(context.Background(), cr.nc) {
+			res.Destroy()
+			continue
+		}
+
+		cn := &conn{
+			cr:  cr,
+			res: res,
+			c:   c,
+		}
+
+		// Set deadlines for both read and write operations upfront.
+		// This single call covers the entire operation lifecycle.
+		cn.setDeadlines()
+		return cn, nil
 	}
-	// Set deadlines for both read and write operations upfront.
-	// This single call covers the entire operation lifecycle.
-	res.Value().setDeadlines()
-	return res, nil
+}
+
+// pingConn sends a version command to verify the connection is alive
+func (c *Client) pingConn(cr *connResource) error {
+	timeout := c.netTimeout()
+	//nolint:errcheck
+	cr.nc.SetDeadline(time.Now().Add(timeout))
+
+	if _, err := cr.rw.WriteString("version\r\n"); err != nil {
+		return err
+	}
+	if err := cr.rw.Flush(); err != nil {
+		return err
+	}
+	line, err := cr.rw.ReadSlice('\n')
+	if err != nil {
+		return err
+	}
+	if !bytes.HasPrefix(line, versionPrefix) {
+		return fmt.Errorf("memcache: unexpected response from version: %q", string(line))
+	}
+	return nil
 }
 
 func (c *Client) netTimeout() time.Duration {
@@ -337,36 +901,37 @@ func (c *Client) maxIdleConns() int {
 // too long to connect to the desired host. This level of
 // detail can generally be ignored.
 type ConnectTimeoutError struct {
-	Addr net.Addr
+	Addr    net.Addr
+	Timeout time.Duration
 }
 
 func (cte *ConnectTimeoutError) Error() string {
-	return "memcache: connect timeout to " + cte.Addr.String()
+	return fmt.Sprintf("memcache: connect timeout to %s after %v", cte.Addr.String(), cte.Timeout)
 }
 
 func (c *Client) dial(addr net.Addr) (net.Conn, error) {
 	conn, err := net.DialTimeout(addr.Network(), addr.String(), c.netTimeout())
 	if err != nil {
 		if ne, ok := err.(net.Error); ok && ne.Timeout() {
-			return nil, &ConnectTimeoutError{addr}
+			return nil, &ConnectTimeoutError{Addr: addr, Timeout: c.netTimeout()}
 		}
 		return nil, err
 	}
 	return conn, nil
 }
 
-func (c *Client) onItem(item *Item, fn func(*Client, *conn, *Item) error) error {
+func (c *Client) onItem(item *Item, fn func(*Client, *conn, *Item) error) (err error) {
 	addr, err := c.selector.PickServer(item.Key)
 	if err != nil {
 		return err
 	}
-	res, err := c.acquireConn(addr)
+	cn, err := c.acquireConn(addr)
 	if err != nil {
 		return err
 	}
-	cn := res.Value()
-	defer cn.condRelease(res, err)
-	return fn(c, cn, item)
+	defer func() { cn.condRelease(err) }()
+	err = fn(c, cn, item)
+	return err
 }
 
 func (c *Client) FlushAll() error {
@@ -422,13 +987,13 @@ func (c *Client) withKeyAddr(key []byte, fn func(net.Addr) error) (err error) {
 }
 
 func (c *Client) withAddrRw(addr net.Addr, fn func(*conn) error) (err error) {
-	res, err := c.acquireConn(addr)
+	cn, err := c.acquireConn(addr)
 	if err != nil {
 		return err
 	}
-	cn := res.Value()
-	defer cn.condRelease(res, err)
-	return fn(cn)
+	defer func() { cn.condRelease(err) }()
+	err = fn(cn)
+	return err
 }
 
 func (c *Client) withKeyRw(key []byte, fn func(*conn) error) error {
@@ -451,48 +1016,48 @@ func (c *Client) getFromAddr(addr net.Addr, keys [][]byte, cb func(*Item)) error
 		//nolint:errcheck
 		buf.WriteString("\r\n")
 
-		if _, err := cn.rw.Write(buf.B); err != nil {
+		if _, err := cn.rw().Write(buf.B); err != nil {
 			bytebufferpool.Put(buf)
 			return err
 		}
 		bytebufferpool.Put(buf)
-		if err := cn.rw.Flush(); err != nil {
+		if err := cn.rw().Flush(); err != nil {
 			return err
 		}
-		return parseGetResponse(cn.rw.Reader, cn, nil, cb)
+		return parseGetResponse(cn.rw().Reader, cn, nil, cb)
 	})
 }
 
 func (c *Client) getFromAddrWithItem(addr net.Addr, keys [][]byte, item *Item, cb func(*Item)) error {
 	return c.withAddrRw(addr, func(cn *conn) error {
 		//nolint:errcheck
-		cn.rw.WriteString("gets")
+		cn.rw().WriteString("gets")
 		for _, key := range keys {
 			//nolint:errcheck
-			cn.rw.WriteByte(' ')
+			cn.rw().WriteByte(' ')
 			//nolint:errcheck
-			cn.rw.Write(key)
+			cn.rw().Write(key)
 		}
 		//nolint:errcheck
-		cn.rw.WriteString("\r\n")
+		cn.rw().WriteString("\r\n")
 
-		if err := cn.rw.Flush(); err != nil {
+		if err := cn.rw().Flush(); err != nil {
 			return err
 		}
-		return parseGetResponse(cn.rw.Reader, cn, item, cb)
+		return parseGetResponse(cn.rw().Reader, cn, item, cb)
 	})
 }
 
 // flushAllFromAddr send the flush_all command to the given addr
 func (c *Client) flushAllFromAddr(addr net.Addr) error {
 	return c.withAddrRw(addr, func(cn *conn) error {
-		if _, err := cn.rw.WriteString("flush_all\r\n"); err != nil {
+		if _, err := cn.rw().WriteString("flush_all\r\n"); err != nil {
 			return err
 		}
-		if err := cn.rw.Flush(); err != nil {
+		if err := cn.rw().Flush(); err != nil {
 			return err
 		}
-		line, err := cn.rw.ReadSlice('\n')
+		line, err := cn.rw().ReadSlice('\n')
 		if err != nil {
 			return err
 		}
@@ -506,13 +1071,13 @@ func (c *Client) flushAllFromAddr(addr net.Addr) error {
 // ping sends the version command to the given addr
 func (c *Client) ping(addr net.Addr) error {
 	return c.withAddrRw(addr, func(cn *conn) error {
-		if _, err := cn.rw.WriteString("version\r\n"); err != nil {
+		if _, err := cn.rw().WriteString("version\r\n"); err != nil {
 			return err
 		}
-		if err := cn.rw.Flush(); err != nil {
+		if err := cn.rw().Flush(); err != nil {
 			return err
 		}
-		line, err := cn.rw.ReadSlice('\n')
+		line, err := cn.rw().ReadSlice('\n')
 		if err != nil {
 			return err
 		}
@@ -536,15 +1101,15 @@ func (c *Client) touchFromAddr(addr net.Addr, key []byte, expiration int32) erro
 		//nolint:errcheck
 		buf.WriteString("\r\n")
 
-		if _, err := cn.rw.Write(buf.B); err != nil {
+		if _, err := cn.rw().Write(buf.B); err != nil {
 			bytebufferpool.Put(buf)
 			return err
 		}
 		bytebufferpool.Put(buf)
-		if err := cn.rw.Flush(); err != nil {
+		if err := cn.rw().Flush(); err != nil {
 			return err
 		}
-		line, err := cn.rw.ReadSlice('\n')
+		line, err := cn.rw().ReadSlice('\n')
 		if err != nil {
 			return err
 		}
@@ -605,45 +1170,47 @@ func (c *Client) GetMulti(keys [][]byte) (map[string]*Item, error) {
 // scanGetResponseLine populates it and returns the declared size of the item.
 // It does not read the bytes of the item.
 func scanGetResponseLine(line []byte, it *Item) (size int, err error) {
-	errf := func(line []byte) (int, error) {
-		return -1, fmt.Errorf("memcache: unexpected line in get response: %q", line)
-	}
 	if !bytes.HasPrefix(line, []byte("VALUE ")) || !bytes.HasSuffix(line, []byte("\r\n")) {
-		return errf(line)
+		return -1, fmt.Errorf("memcache: invalid get response format (expected 'VALUE ...'): %q", line)
 	}
 	s := line[6 : len(line)-2]
 	var rest []byte
 	var found bool
 	keySlice, rest, found := cut(s, ' ')
 	if !found {
-		return errf(line)
+		return -1, fmt.Errorf("memcache: missing key in get response: %q", line)
 	}
 	// Copy the key since line may be from ReadSlice which reuses the buffer
 	it.Key = append(it.Key[:0], keySlice...)
-	
+
 	val, rest, found := cut(rest, ' ')
 	if !found {
-		return errf(line)
+		return -1, fmt.Errorf("memcache: missing flags field in get response: %q", line)
 	}
 	flags64, err := strconv.ParseUint(b2s(val), 10, 32)
 	if err != nil {
-		return errf(line)
+		return -1, fmt.Errorf("memcache: invalid flags value %q in get response: %q", val, line)
 	}
 	it.Flags = uint32(flags64)
+	// rest now contains "size" or "size casid"
+	// cut will split on space; if no space found, val contains the entire rest (just size)
 	val, rest, found = cut(rest, ' ')
+	if len(val) == 0 {
+		return -1, fmt.Errorf("memcache: missing size field in get response: %q", line)
+	}
 	size64, err := strconv.ParseUint(b2s(val), 10, 32)
 	if err != nil {
-		return errf(line)
+		return -1, fmt.Errorf("memcache: invalid size value %q in get response: %q", val, line)
 	}
 	if size64 > math.MaxInt { // Can happen if int is 32-bit
-		return errf(line)
+		return -1, fmt.Errorf("memcache: size value %d exceeds maximum allowed (%d) in get response: %q", size64, math.MaxInt, line)
 	}
 	if !found { // final CAS ID is optional.
 		return int(size64), nil
 	}
 	it.CasID, err = strconv.ParseUint(b2s(rest), 10, 64)
 	if err != nil {
-		return errf(line)
+		return -1, fmt.Errorf("memcache: invalid CAS ID %q in get response: %q", rest, line)
 	}
 	return int(size64), nil
 }
@@ -796,13 +1363,13 @@ func (*Client) populateOne(cn *conn, verb string, item *Item) error {
 	buf.B = append(buf.B, item.Value...)
 	buf.B = append(buf.B, crlf...)
 
-	if _, err := cn.rw.Write(buf.B); err != nil {
+	if _, err := cn.rw().Write(buf.B); err != nil {
 		return err
 	}
-	if err := cn.rw.Flush(); err != nil {
+	if err := cn.rw().Flush(); err != nil {
 		return err
 	}
-	line, err := cn.rw.ReadSlice('\n')
+	line, err := cn.rw().ReadSlice('\n')
 	if err != nil {
 		return err
 	}
@@ -834,15 +1401,15 @@ func (c *Client) Delete(key []byte) error {
 		//nolint:errcheck
 		buf.WriteString("\r\n")
 
-		if _, err := cn.rw.Write(buf.B); err != nil {
+		if _, err := cn.rw().Write(buf.B); err != nil {
 			bytebufferpool.Put(buf)
 			return err
 		}
 		bytebufferpool.Put(buf)
-		if err := cn.rw.Flush(); err != nil {
+		if err := cn.rw().Flush(); err != nil {
 			return err
 		}
-		line, err := cn.rw.ReadSlice('\n')
+		line, err := cn.rw().ReadSlice('\n')
 		if err != nil {
 			return err
 		}
@@ -868,13 +1435,13 @@ func (c *Client) Delete(key []byte) error {
 // DeleteAll deletes all items in the cache.
 func (c *Client) DeleteAll() error {
 	return c.withKeyRw([]byte(""), func(cn *conn) error {
-		if _, err := cn.rw.WriteString("flush_all\r\n"); err != nil {
+		if _, err := cn.rw().WriteString("flush_all\r\n"); err != nil {
 			return err
 		}
-		if err := cn.rw.Flush(); err != nil {
+		if err := cn.rw().Flush(); err != nil {
 			return err
 		}
-		line, err := cn.rw.ReadSlice('\n')
+		line, err := cn.rw().ReadSlice('\n')
 		if err != nil {
 			return err
 		}
@@ -936,15 +1503,15 @@ func (c *Client) getAndTouchFromAddr(addr net.Addr, key []byte, expiration int32
 		//nolint:errcheck
 		buf.WriteString("\r\n")
 
-		if _, err := cn.rw.Write(buf.B); err != nil {
+		if _, err := cn.rw().Write(buf.B); err != nil {
 			bytebufferpool.Put(buf)
 			return err
 		}
 		bytebufferpool.Put(buf)
-		if err := cn.rw.Flush(); err != nil {
+		if err := cn.rw().Flush(); err != nil {
 			return err
 		}
-		return parseGetResponse(cn.rw.Reader, cn, nil, cb)
+		return parseGetResponse(cn.rw().Reader, cn, nil, cb)
 	})
 }
 
@@ -961,15 +1528,15 @@ func (c *Client) getAndTouchFromAddrWithItem(addr net.Addr, key []byte, expirati
 		//nolint:errcheck
 		buf.WriteString("\r\n")
 
-		if _, err := cn.rw.Write(buf.B); err != nil {
+		if _, err := cn.rw().Write(buf.B); err != nil {
 			bytebufferpool.Put(buf)
 			return err
 		}
 		bytebufferpool.Put(buf)
-		if err := cn.rw.Flush(); err != nil {
+		if err := cn.rw().Flush(); err != nil {
 			return err
 		}
-		return parseGetResponse(cn.rw.Reader, cn, item, cb)
+		return parseGetResponse(cn.rw().Reader, cn, item, cb)
 	})
 }
 
@@ -1014,15 +1581,15 @@ func (c *Client) incrDecr(verb, key []byte, delta uint64) (uint64, error) {
 		//nolint:errcheck
 		buf.WriteString("\r\n")
 
-		if _, err := cn.rw.Write(buf.B); err != nil {
+		if _, err := cn.rw().Write(buf.B); err != nil {
 			bytebufferpool.Put(buf)
 			return err
 		}
 		bytebufferpool.Put(buf)
-		if err := cn.rw.Flush(); err != nil {
+		if err := cn.rw().Flush(); err != nil {
 			return err
 		}
-		line, err := cn.rw.ReadSlice('\n')
+		line, err := cn.rw().ReadSlice('\n')
 		if err != nil {
 			return err
 		}
@@ -1039,13 +1606,17 @@ func (c *Client) incrDecr(verb, key []byte, delta uint64) (uint64, error) {
 	return val, err
 }
 
-// Close closes any open connections.
+// Close closes any open connections and stops background health checks.
 //
 // It returns the first error encountered closing connections, but always
 // closes all connections.
 //
 // After Close, the Client may still be used.
 func (c *Client) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.closeChan)
+	})
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, pool := range c.pools {
@@ -1091,13 +1662,13 @@ func (c *Client) getConfigFromAddr(addr net.Addr, configType string, cb func(*Cl
 	return c.withAddrRw(addr, func(cn *conn) error {
 		cmd := fmt.Sprintf("config get %s\r\n", configType)
 
-		if _, err := cn.rw.WriteString(cmd); err != nil {
+		if _, err := cn.rw().WriteString(cmd); err != nil {
 			return err
 		}
-		if err := cn.rw.Flush(); err != nil {
+		if err := cn.rw().Flush(); err != nil {
 			return err
 		}
-		return parseConfigGetResponse(cn.rw.Reader, cb)
+		return parseConfigGetResponse(cn.rw().Reader, cb)
 	})
 }
 
