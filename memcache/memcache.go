@@ -1192,8 +1192,10 @@ func scanGetResponseLine(line []byte, it *Item) (size int, err error) {
 		return -1, fmt.Errorf("memcache: invalid flags value %q in get response: %q", val, line)
 	}
 	it.Flags = uint32(flags64)
+	// rest now contains "size" or "size casid"
+	// cut will split on space; if no space found, val contains the entire rest (just size)
 	val, rest, found = cut(rest, ' ')
-	if !found {
+	if len(val) == 0 {
 		return -1, fmt.Errorf("memcache: missing size field in get response: %q", line)
 	}
 	size64, err := strconv.ParseUint(b2s(val), 10, 32)
